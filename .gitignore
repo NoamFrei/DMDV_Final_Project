@@ -1,0 +1,8 @@
+# Private validation outputs - not for submission
+private_validation/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
