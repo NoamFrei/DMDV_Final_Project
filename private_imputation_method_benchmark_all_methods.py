@@ -5,7 +5,7 @@
 """
 private_imputation_method_benchmark.py
 
-Extended benchmark comparing multiple imputation methods for each feature
+Extended benchmark comparing multiple imputation methods, including XGBoost, CatBoost, LightGBM, ExtraTrees, and HistGradientBoosting when installed, for each feature
 that has missing values in shopper_train.csv (except bounce_rate, which is
 intentionally dropped, and high_intent, which is the target).
 
@@ -38,9 +38,32 @@ from sklearn.metrics import (
 )
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import (
+    RandomForestClassifier, RandomForestRegressor,
+    ExtraTreesClassifier, ExtraTreesRegressor,
+    HistGradientBoostingRegressor,
+)
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import LabelEncoder
+
+try:
+    from xgboost import XGBClassifier, XGBRegressor
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+
+try:
+    from catboost import CatBoostClassifier, CatBoostRegressor
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
+
+try:
+    from lightgbm import LGBMClassifier, LGBMRegressor
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
 
 import matplotlib
 matplotlib.use("Agg")
@@ -328,6 +351,136 @@ def method_cat_D_RandomForest(df_train, feat, missing_mask, cfg):
     return preds
 
 
+
+def method_cat_E_XGBoost(df_train, feat, missing_mask, cfg):
+    """XGBoost classifier for categorical imputation.
+
+    Uses the same non-target feature set as KNN/RF for a fair comparison.
+    Labels are encoded internally because XGBoost expects numeric class labels.
+    """
+    if not HAS_XGBOOST:
+        raise ImportError("xgboost is not installed. Run: pip install xgboost")
+
+    feats = cfg["knn_feats"]
+    known   = df_train[df_train[feat].notna()].dropna(subset=feats)
+    predict = df_train[missing_mask].dropna(subset=feats)
+
+    preds = pd.Series(index=df_train.index[missing_mask], dtype=object)
+    if len(predict) == 0 or len(known) < 5:
+        preds[:] = _cat_mode(df_train, feat)
+        return preds
+
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(known[feat].astype(str))
+
+    xgb = XGBClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        objective="multi:softprob",
+        eval_metric="mlogloss",
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+    xgb.fit(known[feats].values, y_encoded)
+
+    pred_encoded = xgb.predict(predict[feats].values)
+    preds[predict.index] = label_encoder.inverse_transform(pred_encoded.astype(int))
+    preds = preds.fillna(_cat_mode(df_train, feat))
+    return preds
+
+
+
+
+def method_cat_F_CatBoost(df_train, feat, missing_mask, cfg):
+    """CatBoost classifier for categorical imputation."""
+    if not HAS_CATBOOST:
+        raise ImportError("catboost is not installed. Run: pip install catboost")
+
+    feats = cfg["knn_feats"]
+    known   = df_train[df_train[feat].notna()].dropna(subset=feats)
+    predict = df_train[missing_mask].dropna(subset=feats)
+
+    preds = pd.Series(index=df_train.index[missing_mask], dtype=object)
+    if len(predict) == 0 or len(known) < 5:
+        preds[:] = _cat_mode(df_train, feat)
+        return preds
+
+    model = CatBoostClassifier(
+        iterations=300,
+        depth=5,
+        learning_rate=0.05,
+        loss_function="MultiClass",
+        random_seed=RANDOM_SEED,
+        verbose=False,
+        allow_writing_files=False,
+    )
+    model.fit(known[feats], known[feat].astype(str))
+    preds[predict.index] = model.predict(predict[feats]).reshape(-1)
+    preds = preds.fillna(_cat_mode(df_train, feat))
+    return preds
+
+
+def method_cat_G_LightGBM(df_train, feat, missing_mask, cfg):
+    """LightGBM classifier for categorical imputation."""
+    if not HAS_LIGHTGBM:
+        raise ImportError("lightgbm is not installed. Run: pip install lightgbm")
+
+    feats = cfg["knn_feats"]
+    known   = df_train[df_train[feat].notna()].dropna(subset=feats)
+    predict = df_train[missing_mask].dropna(subset=feats)
+
+    preds = pd.Series(index=df_train.index[missing_mask], dtype=object)
+    if len(predict) == 0 or len(known) < 5:
+        preds[:] = _cat_mode(df_train, feat)
+        return preds
+
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(known[feat].astype(str))
+
+    model = LGBMClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+        verbose=-1,
+    )
+    model.fit(known[feats].values, y_encoded)
+    pred_encoded = model.predict(predict[feats].values)
+    preds[predict.index] = label_encoder.inverse_transform(pred_encoded.astype(int))
+    preds = preds.fillna(_cat_mode(df_train, feat))
+    return preds
+
+
+def method_cat_H_ExtraTrees(df_train, feat, missing_mask, cfg):
+    """ExtraTrees classifier for categorical imputation."""
+    feats = cfg["knn_feats"]
+    known   = df_train[df_train[feat].notna()].dropna(subset=feats)
+    predict = df_train[missing_mask].dropna(subset=feats)
+
+    preds = pd.Series(index=df_train.index[missing_mask], dtype=object)
+    if len(predict) == 0 or len(known) < 5:
+        preds[:] = _cat_mode(df_train, feat)
+        return preds
+
+    model = ExtraTreesClassifier(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_leaf=2,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+    model.fit(known[feats].values, known[feat].values)
+    preds[predict.index] = model.predict(predict[feats].values)
+    preds = preds.fillna(_cat_mode(df_train, feat))
+    return preds
+
+
 # ─── Imputation methods: numeric ──────────────────────────────────────────────
 
 def _apply_zero_rule(df_train, feat, missing_mask, cfg):
@@ -489,6 +642,188 @@ def method_num_F_KNN(df_train, feat, missing_mask, cfg):
     knn = KNeighborsRegressor(n_neighbors=7, weights="distance", n_jobs=-1)
     knn.fit(X_tr, known[feat].values)
     preds[predict.index] = np.clip(knn.predict(X_pr), 0, None)
+    preds = preds.fillna(global_med)
+    return preds
+
+
+
+def method_num_G_XGBoost(df_train, feat, missing_mask, cfg):
+    """XGBoost regressor with log1p target transform."""
+    if not HAS_XGBOOST:
+        raise ImportError("xgboost is not installed. Run: pip install xgboost")
+
+    preds, remaining = _apply_zero_rule(df_train, feat, missing_mask, cfg)
+
+    if remaining.sum() == 0:
+        return preds
+
+    rich_feats = cfg["rich_feats"]
+    global_med = df_train.loc[df_train[feat].notna(), feat].median()
+
+    known   = df_train[df_train[feat].notna()].dropna(subset=rich_feats)
+    predict = df_train[remaining].dropna(subset=rich_feats)
+
+    if len(known) < 10 or len(predict) == 0:
+        preds[df_train.index[remaining]] = global_med
+        return preds
+
+    xgb = XGBRegressor(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        objective="reg:squarederror",
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+    xgb.fit(known[rich_feats].values, np.log1p(known[feat].values))
+    preds[predict.index] = np.clip(
+        np.expm1(xgb.predict(predict[rich_feats].values)),
+        0,
+        None,
+    )
+    preds = preds.fillna(global_med)
+    return preds
+
+
+
+
+def method_num_H_CatBoost(df_train, feat, missing_mask, cfg):
+    """CatBoost regressor with log1p target transform."""
+    if not HAS_CATBOOST:
+        raise ImportError("catboost is not installed. Run: pip install catboost")
+
+    preds, remaining = _apply_zero_rule(df_train, feat, missing_mask, cfg)
+    if remaining.sum() == 0:
+        return preds
+
+    rich_feats = cfg["rich_feats"]
+    global_med = df_train.loc[df_train[feat].notna(), feat].median()
+    known   = df_train[df_train[feat].notna()].dropna(subset=rich_feats)
+    predict = df_train[remaining].dropna(subset=rich_feats)
+
+    if len(known) < 10 or len(predict) == 0:
+        preds[df_train.index[remaining]] = global_med
+        return preds
+
+    model = CatBoostRegressor(
+        iterations=300,
+        depth=5,
+        learning_rate=0.05,
+        loss_function="RMSE",
+        random_seed=RANDOM_SEED,
+        verbose=False,
+        allow_writing_files=False,
+    )
+    model.fit(known[rich_feats], np.log1p(known[feat].values))
+    preds[predict.index] = np.clip(
+        np.expm1(model.predict(predict[rich_feats])),
+        0,
+        None,
+    )
+    preds = preds.fillna(global_med)
+    return preds
+
+
+def method_num_I_LightGBM(df_train, feat, missing_mask, cfg):
+    """LightGBM regressor with log1p target transform."""
+    if not HAS_LIGHTGBM:
+        raise ImportError("lightgbm is not installed. Run: pip install lightgbm")
+
+    preds, remaining = _apply_zero_rule(df_train, feat, missing_mask, cfg)
+    if remaining.sum() == 0:
+        return preds
+
+    rich_feats = cfg["rich_feats"]
+    global_med = df_train.loc[df_train[feat].notna(), feat].median()
+    known   = df_train[df_train[feat].notna()].dropna(subset=rich_feats)
+    predict = df_train[remaining].dropna(subset=rich_feats)
+
+    if len(known) < 10 or len(predict) == 0:
+        preds[df_train.index[remaining]] = global_med
+        return preds
+
+    model = LGBMRegressor(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+        verbose=-1,
+    )
+    model.fit(known[rich_feats].values, np.log1p(known[feat].values))
+    preds[predict.index] = np.clip(
+        np.expm1(model.predict(predict[rich_feats].values)),
+        0,
+        None,
+    )
+    preds = preds.fillna(global_med)
+    return preds
+
+
+def method_num_J_ExtraTrees(df_train, feat, missing_mask, cfg):
+    """ExtraTrees regressor with log1p target transform."""
+    preds, remaining = _apply_zero_rule(df_train, feat, missing_mask, cfg)
+    if remaining.sum() == 0:
+        return preds
+
+    rich_feats = cfg["rich_feats"]
+    global_med = df_train.loc[df_train[feat].notna(), feat].median()
+    known   = df_train[df_train[feat].notna()].dropna(subset=rich_feats)
+    predict = df_train[remaining].dropna(subset=rich_feats)
+
+    if len(known) < 10 or len(predict) == 0:
+        preds[df_train.index[remaining]] = global_med
+        return preds
+
+    model = ExtraTreesRegressor(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_leaf=2,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+    model.fit(known[rich_feats].values, np.log1p(known[feat].values))
+    preds[predict.index] = np.clip(
+        np.expm1(model.predict(predict[rich_feats].values)),
+        0,
+        None,
+    )
+    preds = preds.fillna(global_med)
+    return preds
+
+
+def method_num_K_HistGradientBoosting(df_train, feat, missing_mask, cfg):
+    """Scikit-learn HistGradientBoosting regressor with log1p target transform."""
+    preds, remaining = _apply_zero_rule(df_train, feat, missing_mask, cfg)
+    if remaining.sum() == 0:
+        return preds
+
+    rich_feats = cfg["rich_feats"]
+    global_med = df_train.loc[df_train[feat].notna(), feat].median()
+    known   = df_train[df_train[feat].notna()].dropna(subset=rich_feats)
+    predict = df_train[remaining].dropna(subset=rich_feats)
+
+    if len(known) < 10 or len(predict) == 0:
+        preds[df_train.index[remaining]] = global_med
+        return preds
+
+    model = HistGradientBoostingRegressor(
+        max_iter=300,
+        max_leaf_nodes=31,
+        learning_rate=0.05,
+        l2_regularization=0.1,
+        random_state=RANDOM_SEED,
+    )
+    model.fit(known[rich_feats].values, np.log1p(known[feat].values))
+    preds[predict.index] = np.clip(
+        np.expm1(model.predict(predict[rich_feats].values)),
+        0,
+        None,
+    )
     preds = preds.fillna(global_med)
     return preds
 
@@ -749,15 +1084,44 @@ def main():
         "B_ConditionalMode" : method_cat_B_ConditionalMode,
         "C_KNN"             : method_cat_C_KNN,
         "D_RandomForest"    : method_cat_D_RandomForest,
+        "H_ExtraTrees"      : method_cat_H_ExtraTrees,
     }
     num_methods = {
-        "A_Median"              : method_num_A_Median,
-        "B_ConditionalMedian"   : method_num_B_ConditionalMedian,
-        "C_LinearRegression"    : method_num_C_LinearRegression,
-        "D_Ridge"               : method_num_D_Ridge,
-        "E_RandomForest"        : method_num_E_RandomForest,
-        "F_KNN"                 : method_num_F_KNN,
+        "A_Median"                  : method_num_A_Median,
+        "B_ConditionalMedian"       : method_num_B_ConditionalMedian,
+        "C_LinearRegression"        : method_num_C_LinearRegression,
+        "D_Ridge"                   : method_num_D_Ridge,
+        "E_RandomForest"            : method_num_E_RandomForest,
+        "F_KNN"                     : method_num_F_KNN,
+        "J_ExtraTrees"              : method_num_J_ExtraTrees,
+        "K_HistGradientBoosting"    : method_num_K_HistGradientBoosting,
     }
+
+    if HAS_XGBOOST:
+        cat_methods["E_XGBoost"] = method_cat_E_XGBoost
+        num_methods["G_XGBoost"] = method_num_G_XGBoost
+        print("   XGBoost detected: adding XGBoost imputation methods.")
+    else:
+        print("   XGBoost is not installed: skipping XGBoost methods.")
+        print("   To include them, run: pip install xgboost")
+
+    if HAS_CATBOOST:
+        cat_methods["F_CatBoost"] = method_cat_F_CatBoost
+        num_methods["H_CatBoost"] = method_num_H_CatBoost
+        print("   CatBoost detected: adding CatBoost imputation methods.")
+    else:
+        print("   CatBoost is not installed: skipping CatBoost methods.")
+        print("   To include them, run: pip install catboost")
+
+    if HAS_LIGHTGBM:
+        cat_methods["G_LightGBM"] = method_cat_G_LightGBM
+        num_methods["I_LightGBM"] = method_num_I_LightGBM
+        print("   LightGBM detected: adding LightGBM imputation methods.")
+    else:
+        print("   LightGBM is not installed: skipping LightGBM methods.")
+        print("   To include them, run: pip install lightgbm")
+
+    print("   ExtraTrees and HistGradientBoosting are available from scikit-learn and will be included.")
 
     all_rows  = []           # flat list of result dicts
     all_metrics = {}         # feat → method → full metric dict (for summary file)
