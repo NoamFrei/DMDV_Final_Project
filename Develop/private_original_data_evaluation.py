@@ -28,13 +28,14 @@ Preprocessing philosophy (mirrors the benchmark file):
       exactly as the benchmark methods do on the imputation training data.
 
 Run:
-    py private_original_data_evaluation.py
+    py private_original_data_evaluation.py              # label-encoded (default)
+    py private_original_data_evaluation.py --mode both  # compare LE vs OHE
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
-import sys, io
+import sys, io, argparse
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
@@ -92,7 +93,11 @@ except ImportError:
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-PRIVATE_DIR = Path("private_evaluation")
+SCRIPT_DIR   = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+RAW_DIR      = PROJECT_ROOT / "RawData"
+PREPRO_DIR   = PROJECT_ROOT / "PreProcessedData"
+PRIVATE_DIR  = SCRIPT_DIR  / "private_evaluation"
 PRIVATE_DIR.mkdir(exist_ok=True)
 
 BANNER = (
@@ -364,11 +369,214 @@ def compute_metrics(y_true, y_pred, y_proba=None) -> dict:
     }
 
 
+# ── Encoding comparison helpers ────────────────────────────────────────────────
+
+def _quick_eval_encoding(X_train, y_train, X_test, eval_idx, y_true_eval, version_label):
+    """
+    Train all classifiers on X_train and evaluate on X_test.iloc[eval_idx].
+    Returns (rows, trained_models, X_eval) — no CV or plots.
+
+    When X_train has no original CAT_COLS columns (OHE case), cat_cols_present
+    will be empty so Pipeline models just apply StandardScaler to all features.
+    """
+    num_cols         = [c for c in X_train.columns if c not in CAT_COLS]
+    cat_cols_present = [c for c in CAT_COLS if c in X_train.columns]
+
+    models  = build_models(num_cols, cat_cols_present)
+    trained = {}
+    rows    = []
+
+    for name, model in models.items():
+        print(f"   [{version_label}] Fitting {name} ...", end="  ", flush=True)
+        model.fit(X_train, y_train)
+        trained[name] = model
+        print("done")
+
+    X_eval = X_test.iloc[eval_idx].reset_index(drop=True)
+
+    for name, model in trained.items():
+        y_pred  = model.predict(X_eval)
+        y_proba = model.predict_proba(X_eval)[:, 1] if hasattr(model, "predict_proba") else None
+        metrics = compute_metrics(y_true_eval.values, y_pred, y_proba)
+        rows.append({"Version": version_label, "Model": name, **metrics})
+        print(f"   [{version_label}] {name:22s}  "
+              f"ROC-AUC={metrics['ROC-AUC']:.4f}  "
+              f"PR-AUC={metrics['PR-AUC']:.4f}  "
+              f"F1={metrics['F1']:.4f}  "
+              f"Recall={metrics['Recall']:.4f}")
+
+    return rows, trained, X_eval
+
+
+def _run_encoding_comparison(eval_idx, y_true_eval,
+                              le_model_results, n_test):
+    """
+    Compare Label Encoding vs One-Hot Encoding.
+    Called only when --mode both is passed.
+    """
+    ohe_train_path  = PREPRO_DIR / "X_train_preprocessed_one_hot.csv"
+    ohe_test_path   = PREPRO_DIR / "X_test_preprocessed_one_hot.csv"
+    ohe_ytrain_path = PREPRO_DIR / "y_train_one_hot.csv"
+
+    for p in (ohe_train_path, ohe_test_path, ohe_ytrain_path):
+        if not p.exists():
+            print(f"\n   ERROR: {p} not found.")
+            print("   Run 'Final Project - Claude_one_hot.ipynb' first, then retry.")
+            return
+
+    print("\n" + "=" * 72)
+    print(" ENCODING COMPARISON: Label Encoding  vs.  One-Hot Encoding")
+    print("=" * 72)
+
+    X_train_ohe = pd.read_csv(ohe_train_path)
+    X_test_ohe  = pd.read_csv(ohe_test_path)
+    y_train_ohe = pd.read_csv(ohe_ytrain_path).squeeze()
+    print(f"\n   OHE training set : {X_train_ohe.shape}  (LE was 9864×17)")
+    print(f"   Evaluation subset: {len(eval_idx)} rows (same matched rows for both)")
+    print(f"   NOTE: No CV is run in --mode both — private evaluation metrics only.\n")
+
+    # LE rows from already-computed model_results (excludes Submitted Model)
+    le_rows = [{"Version": "Label Encoding", "Model": k, **v}
+               for k, v in le_model_results.items()
+               if k != "Submitted Model"]
+
+    # Train and evaluate OHE models
+    print(f"Training models on OHE data ({X_train_ohe.shape[1]} features)...")
+    ohe_rows, ohe_trained, _ = _quick_eval_encoding(
+        X_train_ohe, y_train_ohe, X_test_ohe, eval_idx, y_true_eval, "One-Hot Encoding"
+    )
+
+    # Combined table
+    comp_df = (
+        pd.DataFrame(le_rows + ohe_rows)
+        .sort_values(["Version", "ROC-AUC"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+
+    # Pretty-print
+    cols = ["ROC-AUC", "PR-AUC", "F1", "Recall", "Precision", "Accuracy"]
+    hdr  = f"  {'Version':<20} {'Model':<24}" + "".join(f" {c:>10}" for c in cols)
+    print("\n" + "=" * len(hdr))
+    print(" COMBINED COMPARISON TABLE")
+    print("=" * len(hdr))
+    print(hdr)
+    print("  " + "─" * (len(hdr) - 2))
+    prev_ver = None
+    for _, row in comp_df.iterrows():
+        if row["Version"] != prev_ver:
+            if prev_ver is not None:
+                print()
+            prev_ver = row["Version"]
+        vals = "".join(f" {row[c]:>10.4f}" for c in cols)
+        print(f"  {row['Version']:<20} {row['Model']:<24}{vals}")
+    print("=" * len(hdr))
+
+    # Save
+    comp_out = PRIVATE_DIR / "private_encoding_comparison.csv"
+    comp_df.to_csv(comp_out, index=False)
+    print(f"\n   Saved → {comp_out}")
+
+    # Save OHE test predictions (best OHE model on all 2466 test rows)
+    ohe_df_sorted = comp_df[comp_df["Version"] == "One-Hot Encoding"].reset_index(drop=True)
+    best_ohe_name = ohe_df_sorted.iloc[0]["Model"]
+    best_ohe_clf  = ohe_trained[best_ohe_name]
+    ohe_pred_all  = best_ohe_clf.predict(X_test_ohe)
+    ohe_proba_all = (
+        best_ohe_clf.predict_proba(X_test_ohe)[:, 1]
+        if hasattr(best_ohe_clf, "predict_proba") else [float("nan")] * n_test
+    )
+    pd.DataFrame({
+        "predicted_high_intent": ohe_pred_all,
+        "proba_high_intent"    : ohe_proba_all,
+    }).to_csv(PREPRO_DIR / "test_predictions_one_hot.csv", index=False)
+    print(f"   Saved test_predictions_one_hot.csv  (model: {best_ohe_name})")
+
+    # ── Answers to 5 questions ─────────────────────────────────────────────────
+    le_sub  = comp_df[comp_df["Version"] == "Label Encoding"].reset_index(drop=True)
+    ohe_sub = comp_df[comp_df["Version"] == "One-Hot Encoding"].reset_index(drop=True)
+    le_best  = le_sub.iloc[0]
+    ohe_best = ohe_sub.iloc[0]
+
+    # Per-model delta (merge on model name)
+    merged = le_sub.merge(ohe_sub, on="Model", suffixes=("_le", "_ohe"))
+    merged["Delta_AUC"] = merged["ROC-AUC_ohe"] - merged["ROC-AUC_le"]
+    merged = merged.sort_values("Delta_AUC", ascending=False).reset_index(drop=True)
+
+    delta_best = ohe_best["ROC-AUC"] - le_best["ROC-AUC"]
+
+    print("\n" + "=" * 72)
+    print(" ANSWERS")
+    print("=" * 72)
+
+    print(f"\n  Q1: Does OHE improve overall results?")
+    print(f"      Best LE  : {le_best['Model']:<24}  ROC-AUC={le_best['ROC-AUC']:.4f}  PR-AUC={le_best['PR-AUC']:.4f}")
+    print(f"      Best OHE : {ohe_best['Model']:<24}  ROC-AUC={ohe_best['ROC-AUC']:.4f}  PR-AUC={ohe_best['PR-AUC']:.4f}")
+    if abs(delta_best) < 0.001:
+        print(f"      → MARGINAL (delta={delta_best:+.4f}). No meaningful difference at the top.")
+    elif delta_best > 0:
+        print(f"      → YES (delta={delta_best:+.4f} ROC-AUC). OHE produces a better best model.")
+    else:
+        print(f"      → NO (delta={delta_best:+.4f} ROC-AUC). Label Encoding is stronger overall.")
+
+    print(f"\n  Q2: Per-model delta (OHE − LE):")
+    n_ohe_better = n_le_better = n_tied = 0
+    for _, r in merged.iterrows():
+        if r["Delta_AUC"] > 0.001:
+            tag = "OHE better"; n_ohe_better += 1
+        elif r["Delta_AUC"] < -0.001:
+            tag = "LE  better"; n_le_better += 1
+        else:
+            tag = "tied      "; n_tied += 1
+        print(f"      {r['Model']:<24}  LE={r['ROC-AUC_le']:.4f}  OHE={r['ROC-AUC_ohe']:.4f}"
+              f"  Δ={r['Delta_AUC']:+.4f}  {tag}")
+
+    overall_best = comp_df.sort_values("ROC-AUC", ascending=False).iloc[0]
+    print(f"\n  Q3: Best version overall:")
+    print(f"      {overall_best['Version']} — {overall_best['Model']}"
+          f"  (ROC-AUC={overall_best['ROC-AUC']:.4f})")
+
+    print(f"\n  Q4: Is the improvement worth changing the pipeline?")
+    print(f"      OHE better in {n_ohe_better}/{len(merged)} models, "
+          f"LE better in {n_le_better}/{len(merged)}, "
+          f"tied in {n_tied}/{len(merged)}.")
+    if n_ohe_better > n_le_better and delta_best > 0.005:
+        print("      → YES. OHE gives consistent gains, especially for linear/distance models.")
+    elif n_le_better >= n_ohe_better:
+        print("      → NO. Label Encoding performs comparably or better for tree-based models,")
+        print("        which don't require ordinal-free encoding. OHE adds 56 extra features")
+        print("        without proportional benefit.")
+    else:
+        print("      → MARGINAL. Results are within noise; OHE is not worth the extra complexity.")
+
+    print(f"\n  Q5: Files summary:")
+    print(f"      CREATED : Final Project - Claude_one_hot.ipynb")
+    print(f"      CREATED : X_train_preprocessed_one_hot.csv  {tuple(X_train_ohe.shape)}")
+    print(f"      CREATED : X_test_preprocessed_one_hot.csv   {tuple(X_test_ohe.shape)}")
+    print(f"      CREATED : y_train_one_hot.csv")
+    print(f"      CREATED : test_predictions_one_hot.csv  (best OHE model: {best_ohe_name})")
+    print(f"      CREATED : private_evaluation/private_encoding_comparison.csv")
+    print(f"      CHANGED : private_original_data_evaluation.py  (added --mode both)")
+    print(f"      NOT CHANGED: Final Project - Claude.ipynb, any other submitted file")
+    improved = merged[merged["Delta_AUC"] >  0.001]["Model"].tolist()
+    worsened = merged[merged["Delta_AUC"] < -0.001]["Model"].tolist()
+    if improved:
+        print(f"\n      Models IMPROVED by OHE : {', '.join(improved)}")
+    if worsened:
+        print(f"      Models WORSENED by OHE : {', '.join(worsened)}")
+    if not improved and not worsened:
+        print(f"\n      No model changed by more than 0.001 ROC-AUC — effectively tied.")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--mode", choices=["original", "both"], default="original")
+    args, _ = parser.parse_known_args()
+    MODE = args.mode
+
     print(BANNER)
     print()
 
@@ -380,12 +588,12 @@ def main():
 
     # ── 1. Load datasets ──────────────────────────────────────────────────────
     print("\n1. Loading datasets...")
-    df_test_raw     = pd.read_csv("shopper_test.csv")
-    df_orig         = pd.read_csv("online_shoppers_intention.csv")
-    X_train_pre     = pd.read_csv("X_train_preprocessed.csv")
-    y_train_full    = pd.read_csv("y_train.csv").squeeze()
-    X_test_pre      = pd.read_csv("X_test_preprocessed.csv")
-    submitted_preds = pd.read_csv("test_predictions.csv")
+    df_test_raw     = pd.read_csv(RAW_DIR    / "shopper_test.csv")
+    df_orig         = pd.read_csv(RAW_DIR    / "online_shoppers_intention.csv")
+    X_train_pre     = pd.read_csv(PREPRO_DIR / "X_train_preprocessed.csv")
+    y_train_full    = pd.read_csv(PREPRO_DIR / "y_train.csv").squeeze()
+    X_test_pre      = pd.read_csv(PREPRO_DIR / "X_test_preprocessed.csv")
+    submitted_preds = pd.read_csv(PREPRO_DIR / "test_predictions.csv")
 
     print(f"   shopper_test.csv              : {df_test_raw.shape}")
     print(f"   online_shoppers_intention.csv : {df_orig.shape}")
@@ -734,6 +942,13 @@ def main():
     print("  NOTE: This script is diagnostic only.  No submitted file was modified.")
     print("  All outputs are isolated to private_evaluation/.")
     print()
+
+    # ── 14. Encoding comparison (--mode both only) ────────────────────────────
+    if MODE == "both":
+        _run_encoding_comparison(
+            eval_idx, y_true_eval, model_results, n_test,
+        )
+
     print(BANNER)
     print()
 

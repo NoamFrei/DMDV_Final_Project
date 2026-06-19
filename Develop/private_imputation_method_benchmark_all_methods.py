@@ -80,7 +80,10 @@ except ImportError:
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-OUTPUT_DIR = Path("private_validation") / "imputation_method_benchmark"
+SCRIPT_DIR   = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+RAW_DIR      = PROJECT_ROOT / "RawData"
+OUTPUT_DIR   = SCRIPT_DIR / "private_validation" / "imputation_method_benchmark"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 BANNER = (
@@ -1019,9 +1022,9 @@ def main():
 
     # ── 1. Load datasets ──────────────────────────────────────────────────────
     print("1. Loading datasets...")
-    df_train = pd.read_csv("shopper_train.csv")
-    df_test  = pd.read_csv("shopper_test.csv")
-    df_orig  = pd.read_csv("online_shoppers_intention.csv")
+    df_train = pd.read_csv(RAW_DIR / "shopper_train.csv")
+    df_test  = pd.read_csv(RAW_DIR / "shopper_test.csv")
+    df_orig  = pd.read_csv(RAW_DIR / "online_shoppers_intention.csv")
 
     print(f"   shopper_train.csv             : {df_train.shape}")
     print(f"   shopper_test.csv              : {df_test.shape}")
